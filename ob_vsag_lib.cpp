@@ -106,7 +106,7 @@ public:
                 const std::string& parameters,
                 const float*& dist, const int64_t*& ids, int64_t &result_size,
                 float valid_ratio, int index_type,
-                roaring::api::roaring64_bitmap_t *bitmap, bool reverse_filter,
+                void *bitmap, bool reverse_filter,
                 bool need_extra_info, const char*& extra_infos);
   std::shared_ptr<vsag::Index>& get_index() {return index_;}
   void set_index(std::shared_ptr<vsag::Index> hnsw) {index_ = hnsw;}
@@ -189,21 +189,22 @@ int HnswIndexHandler::knn_search(const vsag::DatasetPtr& query, int64_t topk,
                const std::string& parameters,
                const float*& dist, const int64_t*& ids, int64_t &result_size,
                float valid_ratio, int index_type,
-               roaring::api::roaring64_bitmap_t *bitmap, bool reverse_filter,
+               void *bitmap, bool reverse_filter,
                bool need_extra_info, const char*& extra_infos) {
     vsag::logger::debug("  search_parameters:{}", parameters);
     vsag::logger::debug("  topk:{}", topk);
     vsag::ErrorType error = vsag::ErrorType::UNKNOWN_ERROR;
-    auto filter = [bitmap, reverse_filter](int64_t id) -> bool {
+    FilterInterface *filter_ptr = static_cast<FilterInterface*>(bitmap);
+    auto filter = [filter_ptr, reverse_filter](int64_t id, void *extra_info = nullptr) -> bool {
         if (!reverse_filter) {
-            return roaring::api::roaring64_bitmap_contains(bitmap, id);
+            return filter_ptr->test(id, extra_info);
         } else {
-            return !roaring::api::roaring64_bitmap_contains(bitmap, id);
+            return !filter_ptr->test(id, extra_info);
         }
     };
     auto vsag_filter = std::make_shared<ObVasgFilter>(valid_ratio, filter);
     auto result = (index_type == HNSW_TYPE || index_type == HGRAPH_TYPE) ?
-                    index_->KnnSearch(query, topk, parameters, bitmap == nullptr ? nullptr : vsag_filter) :
+                    index_->KnnSearch(query, topk, parameters, filter_ptr == nullptr ? nullptr : vsag_filter) :
                     index_->KnnSearch(query, topk, parameters, filter);
     if (result.has_value()) {
         //result的生命周期
@@ -516,17 +517,6 @@ int knn_search(VectorIndexPtr& index_handler, float* query_vector,int dim, int64
         return static_cast<int>(error);
     }
     SlowTaskTimer t("knn_search");
-    // TODO
-    // revert and comment this for compile
-    roaring::api::roaring64_bitmap_t *bitmap = static_cast<roaring::api::roaring64_bitmap_t*>(invalid);
-    // FilterInterface *bitmap = static_cast<FilterInterface*>(invalid);
-    // auto filter = [bitmap, reverse_filter](int64_t id) -> bool {
-    //     if (!reverse_filter) {
-    //         return bitmap->test(id);
-    //     } else {
-    //         return !(bitmap->test(id));
-    //     }
-    // };
     bool owner_set = false;
     nlohmann::json search_parameters;
     HnswIndexHandler* hnsw = static_cast<HnswIndexHandler*>(index_handler);
@@ -541,7 +531,7 @@ int knn_search(VectorIndexPtr& index_handler, float* query_vector,int dim, int64
     query->NumElements(1)->Dim(dim)->Float32Vectors(query_vector)->Owner(false);
     ret = hnsw->knn_search(
         query, topk, search_parameters.dump(), dist, ids, result_size, valid_ratio, index_type,
-        bitmap, reverse_filter,
+        invalid, reverse_filter,
         need_extra_info, extra_infos);
     if (ret != 0) {
         vsag::logger::error("   knn search error happend, ret={}", ret);
