@@ -209,8 +209,7 @@ int HnswIndexHandler::knn_search(const vsag::DatasetPtr& query, int64_t topk,
     vsag::logger::debug("  search_parameters:{}", parameters);
     vsag::logger::debug("  topk:{}", topk);
     vsag::ErrorType error = vsag::ErrorType::UNKNOWN_ERROR;
-    FilterInterface *filter_ptr = static_cast<FilterInterface*>(bitmap);
-    auto filter = [filter_ptr, reverse_filter](int64_t id, void *extra_info = nullptr) -> bool {
+    auto filter = [bitmap, reverse_filter](int64_t id) -> bool {
         if (!reverse_filter) {
             return bitmap->test(id);
         } else {

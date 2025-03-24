@@ -24,7 +24,7 @@ enum IndexType {
 
 class FilterInterface {
 public:
-  virtual bool test(int64_t id, void *extra_info) = 0;
+  virtual bool test(int64_t id) = 0;
 };
 /**
  *   * Get the version based on git revision
