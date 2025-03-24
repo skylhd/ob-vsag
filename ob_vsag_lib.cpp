@@ -11,6 +11,7 @@
 #include "vsag/factory.h"
 #include "vsag/constants.h"
 #include "vsag/filter.h"
+#include "vsag/iterator_context.h"
 
 #include "default_logger.h"
 #include "vsag/logger.h"
@@ -101,13 +102,17 @@ public:
   int get_index_number();
   int add_index(const vsag::DatasetPtr& incremental);
   int cal_distance_by_id(const float* vector, const int64_t* ids, int64_t count, const float*& dist);
+  int get_extra_info_by_ids(const int64_t* ids, 
+                            int64_t count, 
+                            const char *&extra_infos);
   int get_vid_bound(int64_t &min_vid, int64_t &max_vid);
   int knn_search(const vsag::DatasetPtr& query, int64_t topk,
                 const std::string& parameters,
                 const float*& dist, const int64_t*& ids, int64_t &result_size,
                 float valid_ratio, int index_type,
-                void *bitmap, bool reverse_filter,
-                bool need_extra_info, const char*& extra_infos);
+                FilterInterface *bitmap, bool reverse_filter,
+                bool need_extra_info, const char*& extra_infos,
+                void *iter_ctx = nullptr, bool is_last_search = false);
   std::shared_ptr<vsag::Index>& get_index() {return index_;}
   void set_index(std::shared_ptr<vsag::Index> hnsw) {index_ = hnsw;}
   vsag::Allocator* get_allocator() {return allocator_;}
@@ -179,6 +184,15 @@ int HnswIndexHandler::cal_distance_by_id(const float* vector, const int64_t* ids
     return static_cast<int>(error);
 }
 
+int HnswIndexHandler::get_extra_info_by_ids(const int64_t* ids, 
+                                              int64_t count, 
+                                              const char *&extra_infos)
+{
+    vsag::ErrorType error = vsag::ErrorType::UNKNOWN_ERROR;
+    extra_infos = index_->GetExtraInfoByIds(ids, count);
+    return 0;
+}
+
 int HnswIndexHandler::get_vid_bound(int64_t &min_vid, int64_t &max_vid)
 {
     auto result = index_->GetMinAndMaxId(min_vid, max_vid);
@@ -189,23 +203,35 @@ int HnswIndexHandler::knn_search(const vsag::DatasetPtr& query, int64_t topk,
                const std::string& parameters,
                const float*& dist, const int64_t*& ids, int64_t &result_size,
                float valid_ratio, int index_type,
-               void *bitmap, bool reverse_filter,
-               bool need_extra_info, const char*& extra_infos) {
+               FilterInterface *bitmap, bool reverse_filter,
+               bool need_extra_info, const char*& extra_infos,
+               void *iter_ctx, bool is_last_search) {
     vsag::logger::debug("  search_parameters:{}", parameters);
     vsag::logger::debug("  topk:{}", topk);
     vsag::ErrorType error = vsag::ErrorType::UNKNOWN_ERROR;
     FilterInterface *filter_ptr = static_cast<FilterInterface*>(bitmap);
     auto filter = [filter_ptr, reverse_filter](int64_t id, void *extra_info = nullptr) -> bool {
         if (!reverse_filter) {
-            return filter_ptr->test(id, extra_info);
+            return bitmap->test(id);
         } else {
-            return !filter_ptr->test(id, extra_info);
+            return !(bitmap->test(id));
         }
     };
+    tl::expected<std::shared_ptr<vsag::Dataset>, vsag::Error> result;
     auto vsag_filter = std::make_shared<ObVasgFilter>(valid_ratio, filter);
-    auto result = (index_type == HNSW_TYPE || index_type == HGRAPH_TYPE) ?
-                    index_->KnnSearch(query, topk, parameters, filter_ptr == nullptr ? nullptr : vsag_filter) :
+    if (iter_ctx == nullptr) { // knn search without iter filter
+        result = (index_type == HNSW_TYPE || index_type == HGRAPH_TYPE) ?
+                    index_->KnnSearch(query, topk, parameters, bitmap == nullptr ? nullptr : vsag_filter) :
                     index_->KnnSearch(query, topk, parameters, filter);
+    } else { // iter filter
+        vsag::IteratorContextPtr* input_iter = static_cast<vsag::IteratorContextPtr*>(iter_ctx);
+        if (index_type == HNSW_TYPE || index_type == HGRAPH_TYPE || index_type == HNSW_SQ_TYPE) {
+            result = index_->KnnSearch(query, topk, parameters, bitmap == nullptr ? nullptr : vsag_filter, input_iter, is_last_search);
+        } else {
+            error = vsag::ErrorType::UNSUPPORTED_INDEX;
+            vsag::logger::error("knn search iter filter not support BQ.");
+        }
+    }
     if (result.has_value()) {
         //result的生命周期
         result.value()->Owner(false);
@@ -273,7 +299,7 @@ int create_index(VectorIndexPtr& index_handler, IndexType index_type,
         vsag::logger::debug("   null pointer addr, dtype:{}, metric:{}", (void*)dtype, (void*)metric);
         return static_cast<int>(error);
     }
-    SlowTaskTimer t("create_index");
+    SlowTaskTimer t("z");
     vsag::Allocator* vsag_allocator = NULL;
     bool is_support = is_supported_index(index_type);
     const char *base_quantization_type = (index_type == HNSW_SQ_TYPE) ? "sq8" : ((index_type == HNSW_BQ_TYPE) ? "rabitq" : "fp32");
@@ -507,7 +533,8 @@ extern int get_vid_bound(VectorIndexPtr& index_handler, int64_t &min_vid, int64_
 int knn_search(VectorIndexPtr& index_handler, float* query_vector,int dim, int64_t topk,
                const float*& dist, const int64_t*& ids, int64_t &result_size, int ef_search,
                bool need_extra_info, const char*& extra_infos,
-               void* invalid, bool reverse_filter, float valid_ratio) {
+               void* invalid, bool reverse_filter, float valid_ratio, 
+               void *iter_ctx, bool is_last_search) {
     vsag::logger::debug("TRACE LOG[knn_search]:");
     vsag::ErrorType error = vsag::ErrorType::UNKNOWN_ERROR;
     int ret = 0;
@@ -517,6 +544,7 @@ int knn_search(VectorIndexPtr& index_handler, float* query_vector,int dim, int64
         return static_cast<int>(error);
     }
     SlowTaskTimer t("knn_search");
+    FilterInterface *bitmap = static_cast<FilterInterface*>(invalid);
     bool owner_set = false;
     nlohmann::json search_parameters;
     HnswIndexHandler* hnsw = static_cast<HnswIndexHandler*>(index_handler);
@@ -531,8 +559,9 @@ int knn_search(VectorIndexPtr& index_handler, float* query_vector,int dim, int64
     query->NumElements(1)->Dim(dim)->Float32Vectors(query_vector)->Owner(false);
     ret = hnsw->knn_search(
         query, topk, search_parameters.dump(), dist, ids, result_size, valid_ratio, index_type,
-        invalid, reverse_filter,
-        need_extra_info, extra_infos);
+        bitmap, reverse_filter,
+        need_extra_info, extra_infos, 
+        iter_ctx, is_last_search);
     if (ret != 0) {
         vsag::logger::error("   knn search error happend, ret={}", ret);
     }
@@ -769,6 +798,23 @@ int delete_index(VectorIndexPtr& index_handler) {
         index_handler = NULL;
     }
     return 0;
+}
+
+int get_extra_info_by_ids(VectorIndexPtr& index_handler, 
+                          const int64_t* ids, 
+                          int64_t count, 
+                          const char *&extra_infos) {
+    vsag::ErrorType error = vsag::ErrorType::UNKNOWN_ERROR;
+    if (index_handler == nullptr) {
+        vsag::logger::debug("   null pointer addr, index_handler:{}", (void*)index_handler);
+        return static_cast<int>(error);
+    }
+    HnswIndexHandler* hnsw = static_cast<HnswIndexHandler*>(index_handler); 
+    int ret = hnsw->get_extra_info_by_ids(ids, count, extra_infos);
+    if (ret != 0) {
+        vsag::logger::error("   knn search error happend, ret={}", ret);
+    }
+    return ret;
 }
 
 int64_t example() {
